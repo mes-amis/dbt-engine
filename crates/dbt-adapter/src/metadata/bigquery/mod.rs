@@ -7,7 +7,7 @@ use crate::metadata::freshness_overrides::{
 };
 use crate::metadata::*;
 use crate::query_ctx::query_ctx_from_state;
-use crate::record_batch::{RecordBatchExt, StructArrayExt};
+use crate::record_batch::RecordBatchExt;
 use crate::relation::Relation;
 use crate::time_machine::{args_freshness_with_overrides, with_time_machine_metadata_wrapper};
 use crate::{AdapterEngine, AdapterResult};
@@ -21,7 +21,7 @@ use dbt_adbc::*;
 use dbt_common::cancellation::Cancellable;
 use dbt_common::cancellation::CancellationToken;
 use dbt_schemas::dbt_types::RelationType;
-use dbt_schemas::schemas::common::normalize_quote;
+use dbt_schemas::schemas::common::ResolvedQuoting;
 use dbt_schemas::schemas::dbt_column::DbtColumn;
 use dbt_schemas::schemas::legacy_catalog::*;
 use dbt_schemas::schemas::relations::base::*;
@@ -56,28 +56,10 @@ pub fn list_relations(
     db_schema: &CatalogAndSchema,
     token: CancellationToken,
 ) -> AdapterResult<Vec<Arc<dyn BaseRelation>>> {
-    let relations = list_relations_via_adbc(engine, conn, db_schema)?;
-    let connection_project = engine
-        .config("execution_project")
-        .or_else(|| engine.config("project"))
-        .or_else(|| engine.config("database"));
-    let (target_project, _) =
-        normalize_quote(false, AdapterType::Bigquery, &db_schema.rendered_catalog);
-    let is_cross_project =
-        connection_project.is_some_and(|project| project.as_ref() != target_project);
-
-    verify_empty_adbc_listing(relations, is_cross_project, || {
-        list_relations_via_information_schema(engine, ctx, conn, db_schema, token)
-    })
-}
-
-fn list_relations_via_information_schema(
-    engine: &dyn AdapterEngine,
-    ctx: &QueryCtx,
-    conn: &'_ mut dyn Connection,
-    db_schema: &CatalogAndSchema,
-    token: CancellationToken,
-) -> AdapterResult<Vec<Arc<dyn BaseRelation>>> {
+    // GetObjects(Tables) in the shipped Go driver calls tables.get for every
+    // relation. A target-qualified query avoids that serial metadata sweep and
+    // works when the execution project differs from the dataset's project.
+    // https://github.com/dbt-labs/dbt/issues/16318
     let sql = format!(
         "SELECT
     table_catalog,
@@ -89,6 +71,13 @@ FROM
     );
 
     let batch = engine.execute(None, conn, ctx, &sql, token)?;
+    relations_from_table_listing(&batch, engine.quoting())
+}
+
+fn relations_from_table_listing(
+    batch: &RecordBatch,
+    quoting: ResolvedQuoting,
+) -> AdapterResult<Vec<Arc<dyn BaseRelation>>> {
     let table_names = batch.column_values::<StringArray>("table_name")?;
     let table_schemas = batch.column_values::<StringArray>("table_schema")?;
     let table_catalogs = batch.column_values::<StringArray>("table_catalog")?;
@@ -110,7 +99,7 @@ FROM
                 identifier.to_string(),
             )
             .with_relation_type(relation_type)
-            .with_quoting(engine.quoting()),
+            .with_quoting(quoting),
         ) as Arc<dyn BaseRelation>);
     }
     Ok(result)
@@ -160,127 +149,6 @@ WHERE
             .with_quoting(engine.quoting()),
         ) as Arc<dyn BaseRelation>);
     }
-    Ok(result)
-}
-
-fn verify_empty_adbc_listing<F>(
-    relations: Vec<Arc<dyn BaseRelation>>,
-    is_cross_project: bool,
-    fallback: F,
-) -> AdapterResult<Vec<Arc<dyn BaseRelation>>>
-where
-    F: FnOnce() -> AdapterResult<Vec<Arc<dyn BaseRelation>>>,
-{
-    // BigQuery GetObjects exposes only the connection project as a catalog, so a
-    // different target project produces an empty result. Verify emptiness with
-    // the target-qualified metadata query before the caller records the schema
-    // as complete.
-    // https://github.com/dbt-labs/bigquery-adbc/blob/c87c401a934c71783862dface246252d84f9d2e6/go/connection.go#L106-L123
-    if is_cross_project && relations.is_empty() {
-        fallback()
-    } else {
-        Ok(relations)
-    }
-}
-
-fn list_relations_via_adbc(
-    engine: &dyn AdapterEngine,
-    conn: &'_ mut dyn Connection,
-    db_schema: &CatalogAndSchema,
-) -> AdapterResult<Vec<Arc<dyn BaseRelation>>> {
-    // The driver expects unquoted values, so regardless of the adapter's config
-    // we need to strip quotes.
-    let (catalog, _) = normalize_quote(false, AdapterType::Bigquery, &db_schema.rendered_catalog);
-    let (schema, _) = normalize_quote(false, AdapterType::Bigquery, &db_schema.rendered_schema);
-
-    let reader = conn
-        .get_objects(
-            adbc_core::options::ObjectDepth::Tables,
-            Some(&catalog),
-            Some(&schema),
-            None,
-            None,
-            None,
-        )
-        .map_err(adbc_error_to_adapter_error)?;
-
-    let arrow_schema = reader.schema();
-    let batches = reader
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| AdapterError::new(AdapterErrorKind::Driver, e.to_string()))?;
-    let batch = arrow::compute::concat_batches(&arrow_schema, &batches)
-        .map_err(|e| AdapterError::new(AdapterErrorKind::Driver, e.to_string()))?;
-
-    // The schema names are nested in the result of the get object call.
-    // The batch has the following shape at the top level:
-    // - catalog_name: utf8
-    // - catalog_db_schemas: list[struct]
-    //
-    // Each row of the column `catalog_db_schemas` is a list of elements
-    // with the shape:
-    //   - db_schema_name: utf8
-    //   - db_schema_tables: list
-    let catalog_db_schemas = batch
-        .column_by_name("catalog_db_schemas")
-        .and_then(|c| c.as_any().downcast_ref::<ListArray>())
-        .ok_or_else(|| {
-            AdapterError::new(
-                AdapterErrorKind::UnexpectedResult,
-                "Missing or invalid 'catalog_db_schemas' column",
-            )
-        })?;
-
-    let schemas_struct = catalog_db_schemas
-        .values()
-        .as_any()
-        .downcast_ref::<StructArray>()
-        .ok_or_else(|| {
-            AdapterError::new(
-                AdapterErrorKind::UnexpectedResult,
-                "Missing or invalid 'catalog_db_schemas' values",
-            )
-        })?;
-
-    // Each row of the column `db_schema_tables` is a list of elements
-    // with the shape:
-    //   - table_name: utf8
-    //   - table_type: utf8
-    //   - table_columns: list
-    //   - table_constraints: list
-    let db_schema_tables = schemas_struct.column_as::<ListArray>("db_schema_tables")?;
-
-    let tables_struct = db_schema_tables
-        .values()
-        .as_any()
-        .downcast_ref::<StructArray>()
-        .ok_or_else(|| {
-            AdapterError::new(
-                AdapterErrorKind::UnexpectedResult,
-                "Missing or invalid 'db_schema_tables' values",
-            )
-        })?;
-
-    let table_names = tables_struct.column_as::<StringArray>("table_name")?;
-    let table_types = tables_struct.column_as::<StringArray>("table_type")?;
-
-    let mut result = Vec::with_capacity(tables_struct.len());
-    for j in 0..tables_struct.len() {
-        let identifier = table_names.value(j);
-        let relation_type =
-            RelationType::from_adapter_type(AdapterType::Bigquery, table_types.value(j));
-
-        result.push(Arc::new(
-            Relation::new(
-                AdapterType::Bigquery,
-                catalog.clone(),
-                schema.clone(),
-                identifier.to_string(),
-            )
-            .with_relation_type(relation_type)
-            .with_quoting(engine.quoting()),
-        ) as Arc<dyn BaseRelation>);
-    }
-
     Ok(result)
 }
 
@@ -1771,6 +1639,72 @@ fn is_bigquery_permission_error(e: &AdapterError) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn table_listing_preserves_target_project_names_and_types() {
+        use dbt_schemas::schemas::relations::DEFAULT_RESOLVED_QUOTING;
+
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "table_catalog",
+                Arc::new(StringArray::from(vec!["target-project"; 3])) as ArrayRef,
+            ),
+            (
+                "table_schema",
+                Arc::new(StringArray::from(vec!["analytics"; 3])) as ArrayRef,
+            ),
+            (
+                "table_name",
+                Arc::new(StringArray::from(vec!["orders", "summary", "cached"])) as ArrayRef,
+            ),
+            (
+                "table_type",
+                Arc::new(StringArray::from(vec![
+                    "BASE TABLE",
+                    "VIEW",
+                    "MATERIALIZED VIEW",
+                ])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let relations = relations_from_table_listing(&batch, DEFAULT_RESOLVED_QUOTING).unwrap();
+        assert_eq!(relations.len(), 3);
+        for relation in &relations {
+            assert_eq!(relation.database_as_str().unwrap(), "target-project");
+            assert_eq!(relation.schema_as_str().unwrap(), "analytics");
+        }
+        assert_eq!(relations[0].identifier_as_str().unwrap(), "orders");
+        assert_eq!(relations[0].relation_type(), Some(RelationType::Table));
+        assert_eq!(relations[1].relation_type(), Some(RelationType::View));
+        assert_eq!(
+            relations[2].relation_type(),
+            Some(RelationType::MaterializedView)
+        );
+    }
+
+    #[test]
+    fn table_listing_empty_and_malformed_results_are_distinct() {
+        use dbt_schemas::schemas::relations::DEFAULT_RESOLVED_QUOTING;
+
+        let batch = RecordBatch::try_from_iter(
+            ["table_catalog", "table_schema", "table_name", "table_type"]
+                .into_iter()
+                .map(|name| {
+                    (
+                        name,
+                        Arc::new(StringArray::from(Vec::<String>::new())) as ArrayRef,
+                    )
+                }),
+        )
+        .unwrap();
+        assert!(
+            relations_from_table_listing(&batch, DEFAULT_RESOLVED_QUOTING)
+                .unwrap()
+                .is_empty()
+        );
+        let malformed = RecordBatch::new_empty(Arc::new(Schema::empty()));
+        assert!(relations_from_table_listing(&malformed, DEFAULT_RESOLVED_QUOTING).is_err());
+    }
+
     fn bq_rel(project: &str, dataset: &str, table: &str) -> Arc<dyn BaseRelation> {
         use crate::relation::Relation;
         use dbt_schemas::schemas::relations::DEFAULT_RESOLVED_QUOTING;
@@ -1784,65 +1718,6 @@ mod tests {
             )
             .with_quoting(DEFAULT_RESOLVED_QUOTING),
         )
-    }
-
-    #[test]
-    fn cross_project_adbc_miss_uses_target_qualified_fallback() {
-        let relations = verify_empty_adbc_listing(Vec::new(), true, || {
-            Ok(vec![bq_rel(
-                "target-project",
-                "analytics",
-                "existing_table",
-            )])
-        })
-        .unwrap();
-
-        assert_eq!(relations.len(), 1);
-        assert_eq!(relations[0].database_as_str().unwrap(), "target-project");
-        assert_eq!(relations[0].schema_as_str().unwrap(), "analytics");
-        assert_eq!(relations[0].identifier_as_str().unwrap(), "existing_table");
-    }
-
-    #[test]
-    fn same_project_empty_adbc_relation_listing_remains_authoritative() {
-        let relations = verify_empty_adbc_listing(Vec::new(), false, || {
-            panic!("same-project listing should not use the fallback")
-        })
-        .unwrap();
-
-        assert!(relations.is_empty());
-    }
-
-    #[test]
-    fn nonempty_adbc_relation_listing_remains_authoritative() {
-        let relations = verify_empty_adbc_listing(
-            vec![bq_rel("connection-project", "analytics", "adbc_table")],
-            true,
-            || {
-                Ok(vec![bq_rel(
-                    "connection-project",
-                    "analytics",
-                    "fallback_table",
-                )])
-            },
-        )
-        .unwrap();
-
-        assert_eq!(relations.len(), 1);
-        assert_eq!(relations[0].identifier_as_str().unwrap(), "adbc_table");
-    }
-
-    #[test]
-    fn empty_adbc_relation_listing_returns_fallback_error() {
-        let error = verify_empty_adbc_listing(Vec::new(), true, || {
-            Err(AdapterError::new(
-                AdapterErrorKind::SqlExecution,
-                "target-qualified metadata is unavailable",
-            ))
-        })
-        .expect_err("fallback error should be returned");
-
-        assert_eq!(error.kind(), AdapterErrorKind::SqlExecution);
     }
 
     fn freshness_batch(rows: &[(&str, &str, Option<i64>, bool)]) -> RecordBatch {
