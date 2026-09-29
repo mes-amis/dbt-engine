@@ -1,0 +1,7 @@
+kind: Fixes
+body: Use one target-qualified BigQuery INFORMATION_SCHEMA query for relation discovery instead of per-table REST metadata requests.
+time: 2026-09-16T15:06:48.692471+02:00
+custom:
+    author: max-santiago
+    issue: "16318"
+    project: dbt-core

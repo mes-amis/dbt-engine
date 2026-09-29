@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "dbt-core"
 requires-python = ">=3.11"
-dynamic = ["version"]
+version = "2.0.4+monami.1"
 dependencies = ["mashumaro[msgpack]>=3.14"]
 
 # The `dbt` CLI is served from this wheel's compiled extension (dbt._core), so
