@@ -16,14 +16,16 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+use arrow::array::{Array, BooleanArray, RecordBatch};
 use tokio::sync::mpsc;
 
 use crate::context::TaskRunnerCtx;
 use crate::task::{TaskOp, TaskResult};
 use dbt_adapter::AdapterResult;
+use dbt_adapter::cache::hydrate_relation_cache_if_not_already_cached;
 use dbt_adapter::errors::{AdapterError, AdapterErrorKind, Cancellable, into_fs_error};
 use dbt_adapter::metadata::{
-    CatalogAndSchema, FreshnessOverride, MetadataAdapter, MetadataFreshness, MetadataQueryOptions,
+    FreshnessOverride, MetadataAdapter, MetadataFreshness, MetadataQueryOptions,
 };
 use dbt_adapter::record_batch::RecordBatchExt;
 use dbt_adapter::relation::{RelationObject, create_relation, create_relation_from_node};
@@ -56,6 +58,7 @@ use dbt_schemas::schemas::{
 use dbt_state::explain::{
     StateExplainLogRecord, StateExplainNode, StateExplainNodeInfo, append_state_explain_log_record,
 };
+use dbt_state::materialization;
 use dbt_state::metadata_cache::{MetadataPrefetchGuard, RunCacheMetadataCache};
 use dbt_state::node_session::ExecutionGuard;
 use dbt_state::proto::query_cache::{
@@ -75,7 +78,7 @@ use dbt_telemetry::{NodeEvaluated, NodeType};
 use crate::run_cache::run_cache_request::{
     DbtProjectInfo, SeedRunCacheRequestContext, SqlRunCacheRequestContext, build_model_sql_request,
     build_seed_values_request, build_snapshot_sql_request, build_test_sql_request,
-    is_microbatch_model, node_identity,
+    is_microbatch_model, model_is_custom_materialization, model_is_view, node_identity,
 };
 use chrono::{DateTime, Utc};
 
@@ -708,6 +711,33 @@ pub(crate) fn has_metadata_address(adapter_type: AdapterType, relation: &dyn Bas
                 .is_some_and(|database| !database.trim().is_empty()))
 }
 
+fn parse_case_sensitivity_result(batch: &RecordBatch) -> Option<bool> {
+    let schema = batch.schema();
+    let column_name = schema.fields().first()?.name();
+
+    let col = batch.column_values::<BooleanArray>(column_name).ok()?;
+    (col.len() == 1 && col.is_valid(0)).then(|| col.value(0))
+}
+
+async fn check_redshift_case_sensitivity(ctx: &TaskRunnerCtx) -> bool {
+    let sql: &str =
+        "SELECT CURRENT_SETTING('enable_case_sensitive_identifier')::boolean AS case_sensitive";
+    let ctx_inner = ctx.clone();
+    TaskOp::Blocking(Box::new(move || -> Option<bool> {
+        let adapter = ctx_inner.env.get_adapter_ref()?;
+
+        let query_ctx = QueryCtx::default().with_desc("Redshift case-sensitivity setting check");
+        let (_, table) = adapter
+            .execute_without_state(Some(&query_ctx), sql, true, None)
+            .ok()?;
+        parse_case_sensitivity_result(&table.original_record_batch())
+    }))
+    .run()
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
 /// Collect every relation and source freshness override needed for the run's
 /// metadata prefetch.
 ///
@@ -1106,6 +1136,15 @@ pub async fn run_cache_service_before_run(ctx: &TaskRunnerCtx) -> AdapterResult<
     if let Some(clock) = HeuristicClock::bootstrap(ctx).await {
         let _ = ctx.inner.run_cache_ctx.heuristic_clock.set(clock);
     }
+
+    if ctx.default_adapter_type() == AdapterType::Redshift {
+        ctx.inner
+            .run_cache_ctx
+            .redshift_case_sensitivity_enabled
+            .get_or_init(|| async { check_redshift_case_sensitivity(ctx).await })
+            .await;
+    }
+
     Ok(())
 }
 
@@ -1369,7 +1408,10 @@ async fn submit_run_cache_session_start(ctx: &TaskRunnerCtx) {
     let Some(config) = run_cache_ctx.run_cache_service_config.as_ref() else {
         return;
     };
-    let event = session_start_event(config.telemetry_config(), next_telemetry_event_order(ctx));
+    let event = session_start_event(
+        config.telemetry_config(ctx.dbt_profile()),
+        next_telemetry_event_order(ctx),
+    );
     submit_run_cache_telemetry_event(ctx, event).await;
 }
 
@@ -1410,10 +1452,7 @@ async fn flush_run_cache_telemetry(ctx: &TaskRunnerCtx) {
 }
 
 fn next_telemetry_event_order(ctx: &TaskRunnerCtx) -> i64 {
-    ctx.inner
-        .run_cache_ctx
-        .telemetry_event_order
-        .fetch_add(1, Ordering::Relaxed)
+    ctx.inner.run_cache_ctx.shared_event_order.next()
 }
 
 /// Submits a runnable node to the dbt State service before local execution.
@@ -1485,12 +1524,12 @@ pub async fn run_cache_service_before_execution(
     }
 
     let result = if let Some(model) = node.as_any().downcast_ref::<DbtModel>() {
-        if is_no_op_model_materialization(model.materialized()) {
+        if !is_submittable_model_materialization(&model.materialized()) {
             let unique_id = node.unique_id();
             let materialization = model.materialized().to_string();
             emit_trace_log_message(|| {
                 format!(
-                    "dbt State service submit skipped for no-op model materialization (node {unique_id}, materialization {materialization})"
+                    "dbt State service submit skipped for non-submittable model materialization (node {unique_id}, materialization {materialization})"
                 )
             });
             write_state_explain_node(ctx, node, None);
@@ -1706,17 +1745,10 @@ fn state_explain_node_info_for_parts(
     StateExplainNodeInfo {
         fqn,
         node_resource_type: node.resource_type().as_static_ref().to_string(),
-        is_view: matches!(
-            materialized,
-            DbtMaterialization::View | DbtMaterialization::MetricView
-        ),
-        is_table: matches!(
-            materialized,
-            DbtMaterialization::Table
-                | DbtMaterialization::Incremental
-                | DbtMaterialization::Snapshot
-                | DbtMaterialization::Seed
-        ),
+        is_view: materialization::is_view(&materialized.to_string()),
+        // `is_table` is exclusion-based, so it would otherwise report `inline`
+        // — which has no warehouse relation at all — as a table.
+        is_table: !is_ephemeral && materialization::is_table(&materialized.to_string()),
         is_ephemeral,
         is_incremental_or_snapshot: matches!(
             materialized,
@@ -1996,35 +2028,27 @@ fn drop_stale_view_sql(
         .then(|| format!("drop view if exists {target_relation}"))
 }
 
-/// Fail-open on lookup errors. Uses `list_relations_in_parallel` (same primitive as
-/// `relations_exist`) rather than `freshness`, which some adapters (e.g. Redshift) can't
-/// reliably report for views since it depends on a last-altered timestamp.
+/// Whether `target_relation` exists as a view, so the caller knows to drop it before
+/// cloning something else over it. Fails open to `false` on lookup errors; hydrates the
+/// relation cache so repeat dev-clones into the same schema only hit the warehouse once.
 async fn target_relation_is_view(
     ctx: &TaskRunnerCtx,
     target_relation: &Arc<dyn BaseRelation>,
 ) -> bool {
-    let Some(adapter) = ctx.env.get_adapter_ref() else {
+    let Some(adapter) = ctx.env.get_adapter() else {
         return false;
     };
-    let Some(metadata_adapter) = adapter.metadata_adapter() else {
-        return false;
-    };
-    let semantic_fqn = target_relation.semantic_fqn();
-    let catalog_schema = CatalogAndSchema::from(target_relation);
-    let db_schemas = [catalog_schema.clone()];
-    let Ok(listed) = metadata_adapter
-        .list_relations_in_parallel(&db_schemas, adapter.cancellation_token(), false)
-        .await
-    else {
-        return false;
-    };
-    let Some(Ok(schema_relations)) = listed.get(&catalog_schema) else {
-        return false;
-    };
-    schema_relations
-        .iter()
-        .find(|candidate| candidate.semantic_fqn() == semantic_fqn)
-        .and_then(|relation| relation.relation_type())
+    let _ = hydrate_relation_cache_if_not_already_cached(
+        std::slice::from_ref(target_relation),
+        &adapter,
+        "checking dev-clone target for a stale view",
+    )
+    .await;
+    adapter
+        .engine()
+        .relation_cache()
+        .get_relation(target_relation.as_ref())
+        .and_then(|entry| entry.relation().relation_type())
         == Some(RelationType::View)
 }
 
@@ -2550,10 +2574,7 @@ async fn submit_model(
         ctx,
         model,
         task_result.sql_instruction.sql.clone(),
-        matches!(
-            model.materialized(),
-            DbtMaterialization::View | DbtMaterialization::MetricView
-        ),
+        model_is_view(model, &ctx.inner.materialization_resolver),
         full_refresh,
         microbatch_window,
         client,
@@ -2889,8 +2910,8 @@ async fn prepare_write_only_execution_record(
     await_prefetch(ctx).await;
 
     if let Some(model) = node.as_any().downcast_ref::<DbtModel>() {
-        if is_no_op_model_materialization(model.materialized()) {
-            record_submit_skipped(model, "no-op model materialization");
+        if !is_submittable_model_materialization(&model.materialized()) {
+            record_submit_skipped(model, "non-submittable model materialization");
             return Ok(None);
         }
         if model.common().language.as_deref() != Some("sql") {
@@ -2911,10 +2932,7 @@ async fn prepare_write_only_execution_record(
             ctx,
             model,
             task_result.sql_instruction.sql.clone(),
-            matches!(
-                model.materialized(),
-                DbtMaterialization::View | DbtMaterialization::MetricView
-            ),
+            model_is_view(model, &ctx.inner.materialization_resolver),
             full_refresh,
             false,
         )
@@ -3203,6 +3221,10 @@ async fn build_sql_context(
                 node,
                 config.compare_unrendered_code,
             ),
+            ignore_external_modifications: resolve_ignore_external_modifications(
+                node,
+                config.ignore_external_modifications,
+            ),
             full_refresh,
             clone_time_travel_limit: config.clone_time_travel_limit_seconds,
             clone_table_properties: None,
@@ -3294,6 +3316,16 @@ fn resolve_compare_unrendered_code(
     });
 
     resolved
+}
+
+/// Per-model override for ignoring external / out of band changes.
+fn resolve_ignore_external_modifications(
+    node: &dyn InternalDbtNodeAttributes,
+    service_default: bool,
+) -> bool {
+    model_state_for_node(node)
+        .and_then(|state| state.ignore_external_modifications)
+        .unwrap_or(service_default)
 }
 
 pub fn should_execute_hooks_for_skip_reuse(
@@ -4592,16 +4624,20 @@ fn is_cacheable_resource_type(resource_type: NodeType) -> bool {
     )
 }
 
+/// Whether a node's compiled SQL may not be a plain query.
+///
+/// Uses the same name-plus-dispatch union as the submitted execution type, so
+/// the dependency fallbacks and the wire classification agree on what "custom"
+/// means. A dispatch-only check would miss adapter-specific materializations
+/// such as `metric_view`, whose macro is adapter-internal but whose compiled
+/// code is not necessarily SQL at all.
 fn node_uses_custom_materialization(
     node: &dyn InternalDbtNodeAttributes,
     materialization_resolver: &MaterializationResolver,
 ) -> bool {
     node.as_any()
         .downcast_ref::<DbtModel>()
-        .is_some_and(|model| {
-            materialization_resolver
-                .is_custom_materialization(&model.materialized().to_string(), model.node_adapter())
-        })
+        .is_some_and(|model| model_is_custom_materialization(model, materialization_resolver))
 }
 
 fn parse_sql_relations_for_run_cache(
@@ -4725,9 +4761,27 @@ fn quoting_for_upstream(
         identifier: type_ops.need_quotes_for_ident(upstream.table().as_str()) || upstream.is_prefix,
     }
 }
+// Dialect used when Redshift has enable_case_sensitive_identifier = on. When enabled, Redshift
+// folds unquoted identifiers to lowercase and preserves case only when identifiers are quoted,
+// which matches sqlglot 'lowercase' strategy.
+// https://docs.aws.amazon.com/redshift/latest/dg/r_enable_case_sensitive_identifier.html
+const REDSHIFT_CASE_SENSITIVE_NORMALIZATION_DIALECT: &str =
+    "redshift, normalization_strategy = lowercase";
 
-fn run_cache_dialect(ctx: &TaskRunnerCtx) -> String {
-    ctx.default_adapter_type().to_string()
+pub fn run_cache_dialect(ctx: &TaskRunnerCtx) -> String {
+    let adapter_type = ctx.default_adapter_type();
+    let redshift_case_sensitivity_enabled = ctx
+        .inner
+        .run_cache_ctx
+        .redshift_case_sensitivity_enabled
+        .get()
+        .copied()
+        .unwrap_or(false);
+    if adapter_type == AdapterType::Redshift && redshift_case_sensitivity_enabled {
+        REDSHIFT_CASE_SENSITIVE_NORMALIZATION_DIALECT.to_string()
+    } else {
+        adapter_type.to_string()
+    }
 }
 
 fn should_honor_service_skip(ctx: &TaskRunnerCtx) -> bool {
@@ -4741,6 +4795,7 @@ fn remove_cache_decision_fields(context: &mut SqlRunCacheRequestContext) {
     context.freshness_tolerance_seconds = 0;
     context.lenient_dependencies.clear();
     context.tolerate_nondeterminism = false;
+    context.ignore_external_modifications = false;
     context.clone_time_travel_limit = None;
     context.clone_table_properties = None;
 }
@@ -4769,11 +4824,23 @@ fn effective_run_cache_service_use_cache(
         || (service_requested && matches!(run_cache_mode, RunCacheMode::Noop))
 }
 
+/// Materializations that are inlined into their consumers and therefore never
+/// get a warehouse relation of their own.
 fn is_no_op_model_materialization(materialization: DbtMaterialization) -> bool {
     matches!(
         materialization,
         DbtMaterialization::Ephemeral | DbtMaterialization::Inline
     )
+}
+
+/// Whether a model is submitted to the dbt State service at all.
+///
+/// A node is submitted iff its materialization is table-like or view-like,
+/// which rejects exactly `ephemeral` and `semantic_view`. The `inline`
+/// materialization (inline SQL compilation) is likewise never submitted.
+fn is_submittable_model_materialization(materialization: &DbtMaterialization) -> bool {
+    !matches!(materialization, DbtMaterialization::Inline)
+        && materialization::is_submittable(&materialization.to_string())
 }
 
 fn record_service_decision(
@@ -4974,9 +5041,11 @@ fn record_submit_skipped(node: &dyn InternalDbtNodeAttributes, reason: &'static 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dbt_adapter::metadata::CatalogAndSchema;
     use dbt_adapter::{Adapter, AdapterBuilder, AdapterImpl, AdapterStore};
     use dbt_common::path::DbtPath;
     use dbt_schemas::state::ProfileAdapter;
+    use dbt_state::telemetry::SharedEventOrder;
     use indexmap::IndexMap;
     use std::any::Any;
     use std::future::Future;
@@ -4987,7 +5056,7 @@ mod tests {
     use crate::RunTasksArgs;
     use crate::context::{ExtendedCtx, RunCacheCtx, TaskRunnerCtxInner};
     use arrow::array::RecordBatch;
-    use arrow_schema::{Schema, SchemaRef};
+    use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use dbt_adapter::sql_types::DefaultTypeOps;
     use dbt_adapter::stmt_splitter::DefaultStmtSplitter;
     use dbt_common::cancellation::never_cancels;
@@ -5058,6 +5127,63 @@ mod tests {
         assert!(!info.is_view);
         // Ephemeral models are inlined into their consumers, so naming a
         // warehouse relation for them would name a table that cannot exist.
+        assert!(info.fqn.is_empty());
+    }
+
+    #[test]
+    fn adapter_specific_materializations_get_the_custom_dependency_fallbacks() {
+        // These dispatch to adapter-internal macros, so a dispatch-only check
+        // reports them as built-in. Their compiled code is not necessarily a
+        // plain query though, so they must still get the manifest and
+        // parse-error fallbacks that guard dependency collection — otherwise
+        // an empty or unparseable body silently yields no upstreams.
+        let resolver = MaterializationResolver::new(&BTreeMap::new(), "jaffle_shop");
+
+        for materialization in [
+            DbtMaterialization::DynamicTable,
+            DbtMaterialization::MetricView,
+            DbtMaterialization::StreamingTable,
+        ] {
+            let model = make_model(
+                "model.test.orders",
+                "db",
+                "dbt_test",
+                "orders",
+                materialization.clone(),
+            );
+            assert!(
+                node_uses_custom_materialization(model.as_ref(), &resolver),
+                "{materialization} should take the custom-materialization fallbacks"
+            );
+        }
+
+        for materialization in [DbtMaterialization::Table, DbtMaterialization::Incremental] {
+            let model = make_model(
+                "model.test.orders",
+                "db",
+                "dbt_test",
+                "orders",
+                materialization.clone(),
+            );
+            assert!(
+                !node_uses_custom_materialization(model.as_ref(), &resolver),
+                "{materialization} compiles to a real query and needs no fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn state_explain_node_info_reports_inline_without_a_relation() {
+        // `inline` is not one of the names the table/view classification knows,
+        // and that classification is exclusion-based, so it must not fall
+        // through and report an inline model as a table.
+        let model = state_explain_model(DbtMaterialization::Inline);
+
+        let info = state_explain_node_info_for_parts(AdapterType::Postgres, false, &model);
+
+        assert!(info.is_ephemeral);
+        assert!(!info.is_table);
+        assert!(!info.is_view);
         assert!(info.fqn.is_empty());
     }
 
@@ -5412,13 +5538,48 @@ mod tests {
     }
 
     #[test]
-    fn no_op_model_materializations_are_not_submitted() {
+    fn no_op_model_materializations_have_no_relation() {
         assert!(is_no_op_model_materialization(
             DbtMaterialization::Ephemeral
         ));
         assert!(is_no_op_model_materialization(DbtMaterialization::Inline));
         assert!(!is_no_op_model_materialization(DbtMaterialization::View));
         assert!(!is_no_op_model_materialization(DbtMaterialization::Table));
+    }
+
+    #[test]
+    fn only_virtual_materializations_are_not_submitted() {
+        // A node is submitted iff it is table-like or view-like, which rejects
+        // exactly `ephemeral` and `semantic_view`. `inline` is never submitted
+        // either.
+        assert!(!is_submittable_model_materialization(
+            &DbtMaterialization::Ephemeral
+        ));
+        assert!(!is_submittable_model_materialization(
+            &DbtMaterialization::Inline
+        ));
+        // There is no `semantic_view` variant; it parses as `Unknown`, which is
+        // why the predicate classifies by name rather than by enum variant.
+        assert!(!is_submittable_model_materialization(
+            &DbtMaterialization::Unknown("semantic_view".to_string())
+        ));
+
+        for materialization in [
+            DbtMaterialization::View,
+            DbtMaterialization::MaterializedView,
+            DbtMaterialization::Table,
+            DbtMaterialization::Incremental,
+            DbtMaterialization::Snapshot,
+            DbtMaterialization::DynamicTable,
+            DbtMaterialization::MetricView,
+            DbtMaterialization::StreamingTable,
+            DbtMaterialization::Unknown("custom_table".to_string()),
+        ] {
+            assert!(
+                is_submittable_model_materialization(&materialization),
+                "{materialization} should be submitted"
+            );
+        }
     }
 
     #[dbt_runtime::test]
@@ -6883,6 +7044,7 @@ mod tests {
             pre_clone: None,
             execute_hooks_on_any_reuse: Some(true),
             compare_unrendered_code: None,
+            ignore_external_modifications: None,
         });
 
         assert!(should_execute_hooks_for_skip_reuse(&model, false));
@@ -6897,6 +7059,7 @@ mod tests {
             pre_clone: None,
             execute_hooks_on_any_reuse: None,
             compare_unrendered_code: None,
+            ignore_external_modifications: None,
         });
 
         assert!(should_execute_hooks_for_skip_reuse(&model, true));
@@ -6915,6 +7078,7 @@ mod tests {
             pre_clone: None,
             execute_hooks_on_any_reuse: None,
             compare_unrendered_code: None,
+            ignore_external_modifications: None,
         });
 
         assert_eq!(freshness_tolerance_seconds_for_node(&model, 2700), 7200);
@@ -6929,6 +7093,7 @@ mod tests {
             pre_clone: None,
             execute_hooks_on_any_reuse: None,
             compare_unrendered_code: None,
+            ignore_external_modifications: None,
         });
         model.__model_attr__.freshness = Some(ModelFreshness {
             build_after: Some(ModelFreshnessRules {
@@ -6955,6 +7120,7 @@ mod tests {
             pre_clone: None,
             execute_hooks_on_any_reuse: None,
             compare_unrendered_code: None,
+            ignore_external_modifications: None,
         });
         model.__model_attr__.freshness = Some(ModelFreshness {
             build_after: Some(ModelFreshnessRules {
@@ -6987,6 +7153,7 @@ mod tests {
             pre_clone: None,
             execute_hooks_on_any_reuse: None,
             compare_unrendered_code: None,
+            ignore_external_modifications: None,
         });
         model.__model_attr__.freshness = Some(ModelFreshness {
             build_after: Some(ModelFreshnessRules {
@@ -7012,6 +7179,7 @@ mod tests {
             pre_clone: None,
             execute_hooks_on_any_reuse: None,
             compare_unrendered_code: None,
+            ignore_external_modifications: None,
         });
         model.__common_attr__.meta.insert(
             "run_cache_tolerate_nondeterminism".to_string(),
@@ -7042,6 +7210,7 @@ mod tests {
             pre_clone: None,
             execute_hooks_on_any_reuse: Some(true),
             compare_unrendered_code: None,
+            ignore_external_modifications: None,
         });
 
         assert!(should_execute_hooks_for_skip_reuse(&snapshot, false));
@@ -7089,6 +7258,7 @@ mod tests {
             pre_clone: None,
             execute_hooks_on_any_reuse: None,
             compare_unrendered_code: None,
+            ignore_external_modifications: None,
         });
 
         assert!(resolve_compare_unrendered_code(&model, true));
@@ -7107,6 +7277,7 @@ mod tests {
             pre_clone: None,
             execute_hooks_on_any_reuse: None,
             compare_unrendered_code: Some(true),
+            ignore_external_modifications: None,
         });
         let disabled = model_with_state(ModelState {
             lag_tolerance: None,
@@ -7115,6 +7286,7 @@ mod tests {
             pre_clone: None,
             execute_hooks_on_any_reuse: None,
             compare_unrendered_code: Some(false),
+            ignore_external_modifications: None,
         });
 
         assert!(resolve_compare_unrendered_code(&enabled, false));
@@ -7130,6 +7302,7 @@ mod tests {
             pre_clone: None,
             execute_hooks_on_any_reuse: None,
             compare_unrendered_code: Some(true),
+            ignore_external_modifications: None,
         });
         let test = data_test_with_state(DataTestState {
             require_fresh_data_from: None,
@@ -7139,6 +7312,67 @@ mod tests {
 
         assert!(resolve_compare_unrendered_code(&snapshot, false));
         assert!(resolve_compare_unrendered_code(&test, false));
+    }
+
+    #[test]
+    fn ignore_external_modifications_only_applies_to_models() {
+        let mut view = model_with_state(ModelState {
+            lag_tolerance: None,
+            require_fresh_data_from: None,
+            evaluate_volatile_sql: None,
+            pre_clone: None,
+            execute_hooks_on_any_reuse: None,
+            compare_unrendered_code: None,
+            ignore_external_modifications: Some(true),
+        });
+        view.__base_attr__.materialized = DbtMaterialization::View;
+        assert!(resolve_ignore_external_modifications(&view, false));
+
+        view.__model_attr__
+            .state
+            .as_mut()
+            .unwrap()
+            .ignore_external_modifications = Some(false);
+        assert!(!resolve_ignore_external_modifications(&view, true));
+
+        view.__model_attr__.state = None;
+        assert!(resolve_ignore_external_modifications(&view, true));
+        assert!(!resolve_ignore_external_modifications(&view, false));
+
+        for materialization in [
+            DbtMaterialization::Table,
+            DbtMaterialization::Incremental,
+            DbtMaterialization::MetricView,
+        ] {
+            view.__base_attr__.materialized = materialization;
+            view.__model_attr__.state = Some(ModelState {
+                lag_tolerance: None,
+                require_fresh_data_from: None,
+                evaluate_volatile_sql: None,
+                pre_clone: None,
+                execute_hooks_on_any_reuse: None,
+                compare_unrendered_code: None,
+                ignore_external_modifications: Some(true),
+            });
+            assert!(resolve_ignore_external_modifications(&view, false));
+        }
+
+        let snapshot = snapshot_with_state(ModelState {
+            lag_tolerance: None,
+            require_fresh_data_from: None,
+            evaluate_volatile_sql: None,
+            pre_clone: None,
+            execute_hooks_on_any_reuse: None,
+            compare_unrendered_code: None,
+            ignore_external_modifications: Some(true),
+        });
+        let data_test = data_test_with_state(DataTestState {
+            require_fresh_data_from: None,
+            evaluate_volatile_sql: None,
+            compare_unrendered_code: None,
+        });
+        assert!(resolve_ignore_external_modifications(&snapshot, false));
+        assert!(!resolve_ignore_external_modifications(&data_test, false));
     }
 
     #[test]
@@ -8001,10 +8235,11 @@ mod tests {
                 view_traverser: None,
                 heuristic_clock: std::sync::OnceLock::new(),
                 prefetch: Default::default(),
-                telemetry_event_order: std::sync::atomic::AtomicI64::new(0),
+                shared_event_order: SharedEventOrder::new(),
                 telemetry_session_start: std::sync::OnceLock::new(),
                 telemetry_session_ended: std::sync::atomic::AtomicBool::new(false),
                 telemetry_dispatcher: std::sync::OnceLock::new(),
+                redshift_case_sensitivity_enabled: tokio::sync::OnceCell::new(),
             },
         );
 
@@ -8019,7 +8254,19 @@ mod tests {
         }
     }
 
+    fn test_task_runner_ctx_with_adapter_type(adapter_type: AdapterType) -> TaskRunnerCtx {
+        let mut ctx = test_task_runner_ctx(None);
+        Arc::get_mut(&mut ctx.inner)
+            .expect("sole owner of inner right after construction")
+            .adapter_store = test_adapter_store_for(adapter_type);
+        ctx
+    }
+
     fn test_adapter_store() -> Arc<AdapterStore> {
+        test_adapter_store_for(AdapterType::Snowflake)
+    }
+
+    fn test_adapter_store_for(adapter_type: AdapterType) -> Arc<AdapterStore> {
         let build: AdapterBuilder = Box::new(|adapter_type| {
             let adapter = AdapterImpl::new_mock(
                 adapter_type,
@@ -8034,10 +8281,69 @@ mod tests {
                 never_cancels(),
             )))
         });
-        Arc::new(
-            AdapterStore::new(vec![AdapterType::Snowflake], AdapterType::Snowflake, build)
-                .expect("valid store"),
-        )
+        Arc::new(AdapterStore::new(vec![adapter_type], adapter_type, build).expect("valid store"))
+    }
+
+    #[dbt_runtime::test]
+    async fn run_cache_dialect_sets_plain_dialect_for_default_redshift() {
+        let ctx = test_task_runner_ctx_with_adapter_type(AdapterType::Redshift);
+        assert_eq!(run_cache_dialect(&ctx), "redshift");
+    }
+
+    #[dbt_runtime::test]
+    async fn run_cache_dialect_sets_plain_dialect_for_non_redshift_adapter() {
+        let ctx = test_task_runner_ctx(None);
+        assert_eq!(run_cache_dialect(&ctx), "snowflake");
+    }
+
+    #[dbt_runtime::test]
+    async fn run_cache_dialect_sets_normalization_dialect_for_redshift_case_sensitive() {
+        let ctx = test_task_runner_ctx_with_adapter_type(AdapterType::Redshift);
+        ctx.inner
+            .run_cache_ctx
+            .redshift_case_sensitivity_enabled
+            .set(true)
+            .expect("cell already initialized");
+
+        assert_eq!(
+            run_cache_dialect(&ctx),
+            REDSHIFT_CASE_SENSITIVE_NORMALIZATION_DIALECT
+        );
+    }
+
+    #[dbt_runtime::test]
+    async fn run_cache_dialect_non_redshift_ignores_case_sensitivity_cell() {
+        let ctx = test_task_runner_ctx(None);
+
+        ctx.inner
+            .run_cache_ctx
+            .redshift_case_sensitivity_enabled
+            .set(true)
+            .expect("cell should be empty");
+
+        assert_eq!(run_cache_dialect(&ctx), "snowflake");
+    }
+
+    #[dbt_runtime::test]
+    async fn run_cache_service_redshift_case_sensitivity_enabled_defaults_false() {
+        let ctx = test_task_runner_ctx_with_adapter_type(AdapterType::Redshift);
+
+        let adapter = ctx
+            .adapter_store()
+            .get(AdapterType::Redshift)
+            .expect("mock Redshift adapter");
+
+        let ctx = ctx_with_adapter_in_env(&ctx, &adapter);
+
+        run_cache_service_before_run(&ctx).await.unwrap();
+
+        assert_eq!(
+            ctx.inner
+                .run_cache_ctx
+                .redshift_case_sensitivity_enabled
+                .get(),
+            Some(&false)
+        );
     }
 
     fn clone_target(relation_type: Option<RelationType>) -> Arc<dyn BaseRelation> {
@@ -8121,6 +8427,112 @@ mod tests {
                 .is_none(),
             "existing view is removed from the relation cache"
         );
+    }
+
+    /// `target_relation_is_view` reads the adapter off `ctx.env`, not `ctx.adapter_store()`,
+    /// so tests exercising it need the mock adapter wired into the jinja environment.
+    fn ctx_with_adapter_in_env(ctx: &TaskRunnerCtx, adapter: &Arc<Adapter>) -> TaskRunnerCtx {
+        let mut mj = minijinja::Environment::new();
+        mj.add_global("adapter", adapter.as_value());
+        TaskRunnerCtx {
+            env: Arc::new(JinjaEnv::new(mj)),
+            ..ctx.clone()
+        }
+    }
+
+    #[dbt_runtime::test]
+    async fn target_relation_is_view_uses_relation_cache_when_schema_already_warmed() {
+        let ctx = test_task_runner_ctx(None);
+        let adapter = ctx
+            .adapter_store()
+            .get(AdapterType::Snowflake)
+            .expect("mock adapter");
+        let ctx = ctx_with_adapter_in_env(&ctx, &adapter);
+        let view_target = clone_target(Some(RelationType::View));
+        let catalog_schema = CatalogAndSchema::from(&view_target);
+        // The mock adapter has no metadata_adapter(), so if the cache weren't
+        // consulted first this would fail open to `false`.
+        adapter
+            .engine()
+            .relation_cache()
+            .insert_schema(catalog_schema, vec![Arc::clone(&view_target)]);
+
+        assert!(target_relation_is_view(&ctx, &view_target).await);
+    }
+
+    #[dbt_runtime::test]
+    async fn target_relation_is_view_returns_false_for_cached_non_view() {
+        let ctx = test_task_runner_ctx(None);
+        let adapter = ctx
+            .adapter_store()
+            .get(AdapterType::Snowflake)
+            .expect("mock adapter");
+        let ctx = ctx_with_adapter_in_env(&ctx, &adapter);
+        let table_target = clone_target(Some(RelationType::Table));
+        let catalog_schema = CatalogAndSchema::from(&table_target);
+        adapter
+            .engine()
+            .relation_cache()
+            .insert_schema(catalog_schema, vec![Arc::clone(&table_target)]);
+
+        assert!(!target_relation_is_view(&ctx, &table_target).await);
+    }
+
+    fn case_sensitivity_result_batch(values: Vec<Option<bool>>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "case_sensitive",
+            DataType::Boolean,
+            true,
+        )]));
+        RecordBatch::try_new(schema, vec![Arc::new(BooleanArray::from(values))])
+            .expect("valid single-column boolean batch")
+    }
+
+    #[test]
+    fn parse_case_sensitivity_empty_result_is_none() {
+        assert_eq!(
+            parse_case_sensitivity_result(&case_sensitivity_result_batch(vec![])),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_case_sensitivity_true_result_is_true() {
+        assert_eq!(
+            parse_case_sensitivity_result(&case_sensitivity_result_batch(vec![Some(true)])),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn parse_case_sensitivity_false_result_is_false() {
+        assert_eq!(
+            parse_case_sensitivity_result(&case_sensitivity_result_batch(vec![Some(false)])),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn parse_case_sensitivity_null_result_is_none() {
+        assert_eq!(
+            parse_case_sensitivity_result(&case_sensitivity_result_batch(vec![None])),
+            None
+        );
+    }
+
+    #[dbt_runtime::test]
+    async fn target_relation_is_view_returns_false_when_uncached_and_no_metadata_adapter() {
+        let ctx = test_task_runner_ctx(None);
+        let adapter = ctx
+            .adapter_store()
+            .get(AdapterType::Snowflake)
+            .expect("mock adapter");
+        let ctx = ctx_with_adapter_in_env(&ctx, &adapter);
+        let view_target = clone_target(Some(RelationType::View));
+
+        // Schema was never hydrated, and the mock adapter has no metadata_adapter(),
+        // so this fails open to `false` rather than panicking or blocking.
+        assert!(!target_relation_is_view(&ctx, &view_target).await);
     }
 
     #[dbt_runtime::worker_test]
