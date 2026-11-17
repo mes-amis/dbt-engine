@@ -1,7 +1,7 @@
 # Mon Ami dbt engine fork
 
-Base: dbt-labs/dbt main (`242065240`).
-Python wheel version: `2.0.5+monami.1`. The engine reports `dbt-oss 2.0.5`.
+Base: dbt-labs/dbt main (`5ec87d85a`).
+Python wheel version: `2.0.11+monami.1`. The engine reports `dbt-oss 2.0.11`.
 
 BigQuery relation discovery now uses the existing target-qualified
 `INFORMATION_SCHEMA.TABLES` query directly. The released driver's
@@ -20,5 +20,15 @@ macOS ARM64 and Linux x86_64/ARM64, and smoke-tests installation. Release
 artifacts must be published under a new immutable version; do not replace
 assets referenced by a downstream `uv.lock`.
 
+Upstream closed issue 16318 by bumping the BigQuery ADBC driver to
+`0.21.0.dev+dbt0.21.21`, but upstream `list_relations` still calls
+`GetObjects(Tables)` first and falls back to `INFORMATION_SCHEMA.TABLES`
+only on errors or cross-project misses. When syncing, keep the fork's
+direct query and drop upstream's `verify_adbc_listing` /
+`list_relations_via_adbc` path.
+
 Remove the downstream override once an upstream version passes the same
 single-model network benchmark without the per-object metadata sweep.
+
+Local macOS builds may fail with `ld: library 'System' not found`; set
+`SDKROOT=$(xcrun --show-sdk-path)`.
